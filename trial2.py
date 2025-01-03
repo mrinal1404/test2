@@ -9,6 +9,7 @@ import requests
 import tkinter as tk
 from tkinter import messagebox, simpledialog
 from typing import Optional, Tuple, Dict, Any
+import time
 
 class GestureVideoCallApp:
     def __init__(self, host: str = '0.0.0.0', port: int = 65432):
@@ -225,6 +226,101 @@ class GestureVideoCallApp:
         finally:
             self.root.deiconify()
 
+    def _start_client_stream(self):
+        """Handle client-side video streaming"""
+        try:
+            cap = cv2.VideoCapture(0)
+            
+            # Set video quality based on user selection
+            quality_settings = {
+                "low": (640, 480, 15),
+                "medium": (1280, 720, 30),
+                "high": (1920, 1080, 30)
+            }
+            
+            width, height, fps = quality_settings[self.quality_var.get()]
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            cap.set(cv2.CAP_PROP_FPS, fps)
+            
+            # Start receive thread
+            receive_thread = threading.Thread(target=self._receive_stream, args=(self.socket,))
+            receive_thread.daemon = True
+            receive_thread.start()
+            
+            while self.should_run and self.is_connected:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                    
+                gesture, annotated_frame = self.detect_gesture(frame)
+                _, buffer = cv2.imencode('.jpg', annotated_frame, 
+                    [cv2.IMWRITE_JPEG_QUALITY, 85])
+                frame_bytes = base64.b64encode(buffer)
+                
+                payload = {
+                    'frame': frame_bytes.decode('utf-8'),
+                    'gesture': self.gesture_translations.get(gesture, ''),
+                    'timestamp': time.time()
+                }
+                
+                self.socket.send(json.dumps(payload).encode('utf-8'))
+                
+                cv2.imshow('Local Video', annotated_frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+                    
+        except Exception as e:
+            self.update_status(f"Stream error: {str(e)}", "error")
+        finally:
+            cap.release()
+            cv2.destroyAllWindows()
+            self.cleanup()
+
+    def _receive_stream(self, connection):
+        """Handle receiving video stream data"""
+        while self.should_run and self.is_connected:
+            try:
+                data = connection.recv(65536)
+                if not data:
+                    break
+                
+                self.receive_buffer.extend(data)
+                
+                try:
+                    payload = json.loads(self.receive_buffer.decode())
+                    frame_data = base64.b64decode(payload['frame'])
+                    frame_array = np.frombuffer(frame_data, dtype=np.uint8)
+                    frame = cv2.imdecode(frame_array, cv2.IMREAD_COLOR)
+                    
+                    if frame is not None:
+                        # Display received gesture if present
+                        if payload.get('gesture'):
+                            cv2.putText(
+                                frame,
+                                payload['gesture'],
+                                (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                1,
+                                (0, 255, 0),
+                                2
+                            )
+                        
+                        cv2.imshow('Remote Video', frame)
+                        cv2.waitKey(1)
+                    
+                    self.receive_buffer = bytearray()
+                    
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    # Incomplete data, continue receiving
+                    continue
+                    
+            except Exception as e:
+                print(f"Receive error: {e}")
+                break
+        
+        self.cleanup()
+
     def _handle_video_stream(self, client: socket.socket):
         """Enhanced video stream handler with quality settings"""
         cap = cv2.VideoCapture(0)
@@ -321,76 +417,4 @@ class GestureVideoCallApp:
         
         # Calculate key angles and distances for better gesture recognition
         if self._is_peace_sign(points):
-            return 'peace'
-        elif self._is_thumbs_up(points):
-            return 'thumbs_up'
-        elif self._is_open_palm(points):
-            return 'open_palm'
-        elif self._is_closed_fist(points):
-            return 'fist'
-        elif self._is_pointing(points):
-            return 'point'
-        elif self._is_waving(points):
-            return 'wave'
-        
-        return None
-
-    # Improved gesture detection methods with better accuracy
-    def _is_peace_sign(self, points: np.ndarray) -> bool:
-        return (points[8, 1] < points[6, 1] and  # Index finger up
-                points[12, 1] < points[10, 1] and  # Middle finger up
-                points[16, 1] > points[14, 1] and  # Ring finger down
-                points[20, 1] > points[18, 1])     # Pinky down
-
-    def _is_thumbs_up(self, points: np.ndarray) -> bool:
-        return (points[4, 1] < points[3, 1] and    # Thumb up
-                all(points[i, 1] > points[i-1, 1]   # Other fingers down
-                    for i in [8, 12, 16, 20]))
-
-    def _is_open_palm(self, points: np.ndarray) -> bool:
-        return (all(points[i, 1] < points[i-1, 1]   # All fingers up
-                   for i in [8, 12, 16, 20]) and
-                points[4, 0] < points[3, 0])        # Thumb position
-
-    def _is_closed_fist(self, points: np.ndarray) -> bool:
-        return (all(points[i, 1] > points[i-2, 1]   # All fingers curled
-                   for i in [8, 12, 16, 20]) and
-                points[4, 0] > points[3, 0])        # Thumb position
-
-    def _is_pointing(self, points: np.ndarray) -> bool:
-        return (points[8, 1] < points[6, 1] and    # Index finger up
-                all(points[i, 1] > points[i-1, 1]   # Other fingers down
-                    for i in [12, 16, 20]))
-
-    def _is_waving(self, points: np.ndarray) -> bool:
-        return (points[8, 0] > points[6, 0] and    # Fingers spread
-                points[4, 0] < points[2, 0] and    # Thumb position
-                all(points[i, 1] < points[i-1, 1]   # Fingers up
-                    for i in [8, 12, 16, 20]))
-
-    def cleanup(self):
-        """Enhanced cleanup with proper resource management"""
-        self.should_run = False
-        self.is_connected = False
-        
-        if hasattr(self, 'socket'):
-            try:
-                self.socket.shutdown(socket.SHUT_RDWR)
-                self.socket.close()
-            except:
-                pass
-            
-        cv2.destroyAllWindows()
-        self.update_status("Disconnected", "warning")
-
-    def cleanup_and_exit(self):
-        """Clean exit with proper cleanup"""
-        self.cleanup()
-        if self.root:
-            self.root.quit()
-            self.root.destroy()
-
-    def run(self):
-        """Start the application"""
-        try:
-            self.root.mainloop()
+            return 
